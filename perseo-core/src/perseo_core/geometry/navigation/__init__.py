@@ -4,4 +4,5 @@
 """Navigation utilities for sensor trajectory representation."""
 
 from perseo_core.geometry.navigation.cubic_spline_trajectory import *
+from perseo_core.geometry.navigation.extended_cubic_spline_trajectory import *
 from perseo_core.geometry.navigation.trajectory import *
