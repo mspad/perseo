@@ -3,13 +3,13 @@
 
 """Extended Cubic Spline Trajectory module.
 
-This module provides the `ExtendedCubicSplineTrajectory` class, which enables orbit propagation
+This module provides the `ExtendedCubicSplineOrbit` class, which enables orbit propagation
 outside of the domain defined by state vectors
 """
 
 from __future__ import annotations
 
-import os
+import warnings
 
 import numpy as np
 import numpy.typing as npt
@@ -20,14 +20,15 @@ from perseo_core.geometry.navigation.cubic_spline_trajectory import CubicSplineT
 from perseo_core.geometry.navigation.trajectory import Trajectory
 from perseo_core.timing.precise_datetime import PreciseDateTime
 
-os.environ["SATKIT_JPLEPHEM_FILE"] = "lnxp1900p2053.421"
-
 
 class ExtendedCubicSplineOrbit(Trajectory[PreciseDateTime]):
     """Trajectory based on a Cubic Spline interpolator."""
 
-    _CHUNK_S: int = 3600  # extension granularity (also the initial extension)
-    _MAX_EXTENSION_S: int = 7 * 86400  # safety cap: LEO propagation is meaningless much beyond this
+    _INITIAL_EXTENSION_S: int = 120  # propagation performed at initialization
+    _EXTENSION_MARGIN_S: int = 60  # extra propagation beyond the requested time
+    _WARNING_THRESHOLD_S: int = 3600 * 3  # warn when evaluating more than 3 hours past the original trajectory
+    _GRAVITY_DEGREE: int = 70
+    _GRAVITY_ORDER: int = 70
 
     def __init__(
         self,
@@ -35,7 +36,7 @@ class ExtendedCubicSplineOrbit(Trajectory[PreciseDateTime]):
         positions: npt.NDArray[np.floating],
         velocities: npt.NDArray[np.floating],
     ) -> None:
-        """Create a ExtendedCubicSplineOrbit from state vectors: times, positions and velocities.
+        """Create an ExtendedCubicSplineOrbit from state vectors: times, positions and velocities.
 
         Times must be of type PreciseDateTime.
 
@@ -88,7 +89,7 @@ class ExtendedCubicSplineOrbit(Trajectory[PreciseDateTime]):
         self._eci_state = np.hstack([eci_pos, eci_vel])
 
         self._extension: CubicSplineTrajectory | None = None
-        self._extend_by(self._CHUNK_S)
+        self._extend_by(self._INITIAL_EXTENSION_S)
 
     def _extend_by(self, duration_s: int) -> None:
         """Propagate `duration_s` (integer) seconds past the current end of the extension."""
@@ -102,8 +103,8 @@ class ExtendedCubicSplineOrbit(Trajectory[PreciseDateTime]):
             end=sk_times[-1],
             propsettings=sk.propsettings(
                 gravity_model=sk.gravmodel.egm2008,
-                gravity_degree=70,
-                gravity_order=70,
+                gravity_degree=self._GRAVITY_DEGREE,
+                gravity_order=self._GRAVITY_ORDER,
             ),
         )
         evaluation = np.atleast_2d(result.interp(sk_times))
@@ -117,16 +118,20 @@ class ExtendedCubicSplineOrbit(Trajectory[PreciseDateTime]):
         self._extension = CubicSplineTrajectory(self._ext_times, self._ext_pos, self._ext_vel)
 
     def _ensure_covers(self, t_max: PreciseDateTime) -> None:
-        """Extend the propagated trajectory, in whole chunks, so that it covers `t_max`."""
+        """Extend the propagated trajectory so that it covers `t_max` plus a safety margin."""
+        elapsed_s = float(t_max - self._original.domain[1])
+        if elapsed_s > self._WARNING_THRESHOLD_S:
+            warnings.warn(
+                f"Requested time is {elapsed_s:.0f} s past the end of the original trajectory: "
+                f"propagation beyond {self._WARNING_THRESHOLD_S} s may be inaccurate",
+                RuntimeWarning,
+                stacklevel=4,
+            )
         t_end = self._ext_times[-1]
         if t_max <= t_end:
             return
         missing_s = float(t_max - t_end)
-        if float(t_max - self._anchor) > self._MAX_EXTENSION_S:
-            msg = f"Requested time is more than {self._MAX_EXTENSION_S} s past the end of the trajectory"
-            raise RuntimeError(msg)
-        n_chunks = int(np.ceil(missing_s / self._CHUNK_S))
-        self._extend_by(n_chunks * self._CHUNK_S)
+        self._extend_by(int(np.ceil(missing_s)) + self._EXTENSION_MARGIN_S)
 
     @staticmethod
     def _to_satkit_time(times: npt.NDArray) -> list[sk.time]:
@@ -171,8 +176,8 @@ class ExtendedCubicSplineOrbit(Trajectory[PreciseDateTime]):
 
     @property
     def domain(self) -> tuple[PreciseDateTime, PreciseDateTime]:
-        """Accessing time domain."""
-        return (self._original.domain[0], self._anchor + self._MAX_EXTENSION_S)
+        """Accessing time domain (the upper bound grows as the trajectory is propagated)."""
+        return (self._original.domain[0], self._ext_times[-1])
 
     def _evaluate(self, time: PreciseDateTime | npt.NDArray, method: str) -> np.ndarray:
         t = np.atleast_1d(time)
