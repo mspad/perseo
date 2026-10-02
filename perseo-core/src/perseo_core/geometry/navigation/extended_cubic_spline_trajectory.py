@@ -10,56 +10,53 @@ outside of the domain defined by state vectors
 from __future__ import annotations
 
 import os
-from typing import TypeVar
 
 import numpy as np
 import numpy.typing as npt
 import satkit as sk
 
 from perseo_core.geometry.coordinates.conversions import ecef2eci, eci2ecef
-from perseo_core.geometry.navigation import CubicSplineTrajectory
+from perseo_core.geometry.navigation.cubic_spline_trajectory import CubicSplineTrajectory
 from perseo_core.geometry.navigation.trajectory import Trajectory
-from perseo_core.timing import PreciseDateTime
-
-T = TypeVar("T", bound=np.generic)
+from perseo_core.timing.precise_datetime import PreciseDateTime
 
 os.environ["SATKIT_JPLEPHEM_FILE"] = "lnxp1900p2053.421"
 
 
-class ExtendedCubicSplineOrbit(Trajectory[T]):
+class ExtendedCubicSplineOrbit(Trajectory[PreciseDateTime]):
     """Trajectory based on a Cubic Spline interpolator."""
+
+    _CHUNK_S: int = 3600  # extension granularity (also the initial extension)
+    _MAX_EXTENSION_S: int = 7 * 86400  # safety cap: LEO propagation is meaningless much beyond this
 
     def __init__(
         self,
-        times: npt.NDArray[T],
+        times: npt.NDArray,
         positions: npt.NDArray[np.floating],
         velocities: npt.NDArray[np.floating],
-        extension_duration_s: int,
     ) -> None:
         """Create a ExtendedCubicSplineOrbit from state vectors: times, positions and velocities.
 
-        Times must be of type T, either dates or floats.
+        Times must be of type PreciseDateTime.
 
         Positions and velocities must be specified as (N, 3) arrays of floats.
 
         ExtendedCubicSplineOrbit can extend trajectory for low orbit satellites outside the boundaries of time axis
-        through numerical integration.
+        through high precision numerical integration.
 
         Parameters
         ----------
-        times : npt.NDArray[T]
+        times : npt.NDArray
             time axis as numpy array of shape (N,)
         positions : npt.NDArray[np.floating]
             positions as numpy array of shape (N, 3), with coordinates being x, y, z
         velocities : npt.NDArray[np.floating]
             velocities as numpy array of shape (N, 3), with coordinates being x, y, z
-        extension_duration_s : int
-            seconds for which the orbit is extended
 
         """
-        if extension_duration_s <= 0 or int(extension_duration_s) != extension_duration_s:
-            msg = "Extension_duration_s must be a positive integer"
-            raise ValueError(msg)
+        if not all(isinstance(t, PreciseDateTime) for t in times):
+            msg = "Times must be an array of PreciseDateTime"
+            raise TypeError(msg)
 
         if times.ndim != 1:
             msg = "Times must be a 1D array"
@@ -78,42 +75,61 @@ class ExtendedCubicSplineOrbit(Trajectory[T]):
             raise ValueError(msg)
 
         self._original = CubicSplineTrajectory(times=times, positions=positions, velocities=velocities)
-        self._domain: tuple[T, T] = (times[0], times[-1] + extension_duration_s)
 
         t_anchor = self._floor_to_microsecond(times[-1])
-        ecef_pos_anchor = self._original.position(t_anchor)
-        ecef_vel_anchor = self._original.velocity(t_anchor)
-        ext_times = np.arange(0, extension_duration_s + 1, dtype=float) + t_anchor
-        sk_ext_times = self._to_satkit_time(ext_times)
+        self._anchor = t_anchor
+        ecef_pos = self._original.position(t_anchor)
+        ecef_vel = self._original.velocity(t_anchor)
 
-        eci_pos_anchor, ecu_vel_anchor = ecef2eci(ecef_pos_anchor, ecef_vel_anchor, t_anchor)
-        state = np.hstack([eci_pos_anchor, ecu_vel_anchor])
+        self._ext_times: npt.NDArray = np.array([t_anchor], dtype=object)
+        self._ext_pos = np.atleast_2d(ecef_pos)
+        self._ext_vel = np.atleast_2d(ecef_vel)
+        eci_pos, eci_vel = ecef2eci(ecef_pos, ecef_vel, t_anchor)
+        self._eci_state = np.hstack([eci_pos, eci_vel])
+
+        self._extension: CubicSplineTrajectory | None = None
+        self._extend_by(self._CHUNK_S)
+
+    def _extend_by(self, duration_s: int) -> None:
+        """Propagate `duration_s` (integer) seconds past the current end of the extension."""
+        t_last = self._ext_times[-1]
+        new_times = np.arange(0, duration_s + 1, dtype=float) + t_last
+        sk_times = self._to_satkit_time(new_times)
+
         result = sk.propagate(
-            state,
-            sk_ext_times[0],
-            end=sk_ext_times[-1],
+            self._eci_state,
+            sk_times[0],
+            end=sk_times[-1],
             propsettings=sk.propsettings(
-                gravity_model=sk.gravmodel.egm96,
-                gravity_degree=10,
-                gravity_order=10,
+                gravity_model=sk.gravmodel.egm2008,
+                gravity_degree=70,
+                gravity_order=70,
             ),
         )
-        evaluation = np.atleast_2d(result.interp(sk_ext_times))
-        ext_pos_eci, ext_vel_eci = evaluation[:, 0:3], evaluation[:, 3:6]
-        ext_pos, ext_vel = eci2ecef(ext_pos_eci, ext_vel_eci, ext_times)
-        self._extension = CubicSplineTrajectory(ext_times, ext_pos, ext_vel)
+        evaluation = np.atleast_2d(result.interp(sk_times))
+        new_pos, new_vel = eci2ecef(evaluation[:, 0:3], evaluation[:, 3:6], new_times)
+
+        self._ext_times = np.concatenate([self._ext_times, new_times[1:]])
+        self._ext_pos = np.vstack([self._ext_pos, new_pos[1:]])
+        self._ext_vel = np.vstack([self._ext_vel, new_vel[1:]])
+        self._eci_state = evaluation[-1]
+
+        self._extension = CubicSplineTrajectory(self._ext_times, self._ext_pos, self._ext_vel)
+
+    def _ensure_covers(self, t_max: PreciseDateTime) -> None:
+        """Extend the propagated trajectory, in whole chunks, so that it covers `t_max`."""
+        t_end = self._ext_times[-1]
+        if t_max <= t_end:
+            return
+        missing_s = float(t_max - t_end)
+        if float(t_max - self._anchor) > self._MAX_EXTENSION_S:
+            msg = f"Requested time is more than {self._MAX_EXTENSION_S} s past the end of the trajectory"
+            raise RuntimeError(msg)
+        n_chunks = int(np.ceil(missing_s / self._CHUNK_S))
+        self._extend_by(n_chunks * self._CHUNK_S)
 
     @staticmethod
-    def _to_satkit_time(times: PreciseDateTime | npt.NDArray) -> sk.time | npt.NDArray:
-        if isinstance(times, PreciseDateTime):
-            return sk.time(
-                times.year,
-                times.month,
-                times.day_of_the_month,
-                times.hour_of_day,
-                times.minute_of_hour,
-                times.second_of_minute + times.picosecond_of_second * 1e-12,
-            )
+    def _to_satkit_time(times: npt.NDArray) -> list[sk.time]:
         return [
             sk.time(
                 t.year,
@@ -154,17 +170,19 @@ class ExtendedCubicSplineOrbit(Trajectory[T]):
         return self._original.times
 
     @property
-    def domain(self) -> tuple[T, T]:
-        """Trajectory time domain."""
-        return self._domain
+    def domain(self) -> tuple[PreciseDateTime, PreciseDateTime]:
+        """Accessing time domain."""
+        return (self._original.domain[0], self._anchor + self._MAX_EXTENSION_S)
 
     def _evaluate(self, time: PreciseDateTime | npt.NDArray, method: str) -> np.ndarray:
         t = np.atleast_1d(time)
-        if np.any(t < self._domain[0]) or np.any(t > self._domain[1]):
-            msg = "One (or more) of the input times is outside of trajectory time boundaries"
+        if np.any(t < self.domain[0]):
+            msg = "One (or more) of the input times is before the start of the trajectory"
             raise RuntimeError(msg)
 
-        in_original = t <= self._original.times[-1]
+        self._ensure_covers(t.max())
+
+        in_original = t <= self._original.domain[1]
         out = np.empty((t.size, 3))
         if in_original.any():
             out[in_original] = getattr(self._original, method)(t[in_original])
@@ -173,13 +191,13 @@ class ExtendedCubicSplineOrbit(Trajectory[T]):
 
         return out[0] if np.ndim(time) == 0 else out
 
-    def position(self, time: T | npt.NDArray[T]) -> npt.NDArray[np.floating]:
+    def position(self, time: PreciseDateTime | npt.NDArray) -> npt.NDArray[np.floating]:
         """Evaluate x, y, z position at given time.
 
         Parameters
         ----------
-        time : T | npt.NDArray[T]
-            time of the same type of the initialization times axis
+        time : PreciseDateTime | npt.NDArray
+            time of type PreciseDateTime
 
         Returns
         -------
@@ -189,13 +207,13 @@ class ExtendedCubicSplineOrbit(Trajectory[T]):
         """
         return self._evaluate(time, "position")
 
-    def velocity(self, time: T | npt.NDArray[T]) -> npt.NDArray[np.floating]:
+    def velocity(self, time: PreciseDateTime | npt.NDArray) -> npt.NDArray[np.floating]:
         """Evaluate vx, vy, vz velocity at given time.
 
         Parameters
         ----------
-        time : T | npt.NDArray[T]
-            time of the same type of the initialization times axis
+        time : PreciseDateTime | npt.NDArray
+            time of type PreciseDateTime
 
         Returns
         -------
@@ -205,13 +223,13 @@ class ExtendedCubicSplineOrbit(Trajectory[T]):
         """
         return self._evaluate(time, "velocity")
 
-    def acceleration(self, time: T | npt.NDArray[T]) -> npt.NDArray[np.floating]:
+    def acceleration(self, time: PreciseDateTime | npt.NDArray) -> npt.NDArray[np.floating]:
         """Evaluate ax, ay, az acceleration at given time.
 
         Parameters
         ----------
-        time : T | npt.NDArray[T]
-            time of the same type of the initialization times axis
+        time : PreciseDateTime | npt.NDArray
+            time of type PreciseDateTime
 
         Returns
         -------
